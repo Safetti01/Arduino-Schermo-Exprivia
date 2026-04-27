@@ -38,8 +38,8 @@
 #include <time.h>             // per avere data e ora nei log
 #include <AESLib.h>           // per criptare i messaggi MQTT
 
-// -------------------- I PIN DOVE HO COLLEGATO TUTTO --------------------
-// dopo vari tentativi, ho scelto questi perché funzionano bene
+// -------------------- I PIN DOVE COLLEGARE TUTTO --------------------
+// Secondo le mie analisi, ho scelto questi perché funzionano bene
 const int PIN_CHIAVE = 0;        // GPIO0 - l'interruttore con la chiave (solo l'admin ce l'ha)
 const int PIN_TAMPER = 2;        // GPIO2 - microswitch che sente se apro il case
 const int PIN_JUMPER_ADMIN = 4;  // GPIO4 - un ponticello di sicurezza (secondo fattore)
