@@ -115,3 +115,21 @@ const char* MAC_WHITELIST[] = {
     "AA:BB:CC:DD:EE:FF",   // ← metti il MAC del tuo telefono
     "11:22:33:44:55:66"    // ← metti il MAC del tuo PC
 };
+
+## 🔍 COSA FA QUESTO CODICE
+
+Questo codice trasforma un ESP8266 in un **sistema di sorveglianza intelligente** con:
+
+- **Rilevamento movimento** – Sensore PIR, conta le persone che entrano (totali, oggi, settimana, mese)
+- **Monitoraggio ambientale** – Temperatura e umidità (sensore DHT22)
+- **Sicurezza fisica** – Chiave a 2 fattori, interruttore a chiave, tamper anti-apertura, sirena
+- **Pannello web** – Accesso da telefono/PC per vedere tutto e dare comandi
+- **Registro su SD** – Ogni evento (movimenti, accessi, tentativi, tamper) viene salvato con data/ora
+- **Crittografia AES-256** – Tutte le comunicazioni MQTT sono criptate
+- **Comandi remoti MQTT** – Puoi comandare il sistema da qualsiasi parte del mondo
+- **Aggiornamenti OTA** – Carichi nuovo firmware via WiFi, senza cavo USB
+- **Protezione brute force** – Dopo 5 tentativi errati, il sistema si blocca per 5 minuti
+- **Whitelist MAC** – Solo dispositivi autorizzati possono connettersi
+- **Autenticazione a due fattori** – Password + token segreto + chiave fisica
+
+**In pratica:** apri il browser, scrivi l'IP del sistema, inserisci password e token (e giri la chiave fisica), e vedi temperatura, umidità, se qualcuno è entrato, quanti movimenti sono stati fatti oggi, e puoi resettare i contatori o cancellare i log.
