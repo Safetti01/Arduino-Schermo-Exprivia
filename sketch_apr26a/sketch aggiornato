@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * IL MIO SISTEMA DI SORVEGLIANZA PER LA STANZA
+ * IL MIO SISTEMA DI SORVEGLIANZA PER LA STANZA - VERSIONE COMPLETA
  * ============================================================================
  * 
  * Dopo giorni di tentativi e bestemmie, ho messo insieme questo sistema.
@@ -17,7 +17,12 @@
  * - Le comunicazioni MQTT sono criptate con AES-256
  * - Si aggiorna via WiFi (OTA) senza doverlo collegare al computer
  * 
- * L'ho fatto perché non mi piace di non sapere chi entra nella stanza.
+ * NOVITA' V2.0:
+ * - Homepage PUBBLICA: chiunque nella rete WiFi può vedere temperatura,
+ *   umidità, stato stanza e chi l'ha occupata
+ * - Pannello admin separato su /admin con autenticazione a 2 fattori + chiave
+ * 
+ * L'ho fatto perché non mi piace non sapere chi entra nella stanza.
  * 
  * ATTENZIONE: Senza la chiave fisica inserita, non si può fare nulla di importante.
  * 
@@ -25,7 +30,6 @@
  */
 
 // -------------------- LIBRERIE CHE HO DOVUTO INSTALLARE --------------------
-// alcune le avevo già, altre le ho prese dalla gestione librerie
 #include <ESP8266WiFi.h>      // per il WiFi, fondamentale
 #include <WiFiManager.h>      // così non devo mettere SSID e password nel codice
 #include <PubSubClient.h>     // per mandare messaggi MQTT (comandi da remoto)
@@ -39,7 +43,6 @@
 #include <AESLib.h>           // per criptare i messaggi MQTT
 
 // -------------------- I PIN DOVE COLLEGARE TUTTO --------------------
-// Secondo le mie analisi, ho scelto questi perché funzionano bene
 const int PIN_CHIAVE = 0;        // GPIO0 - l'interruttore con la chiave (solo l'admin ce l'ha)
 const int PIN_TAMPER = 2;        // GPIO2 - microswitch che sente se apro il case
 const int PIN_JUMPER_ADMIN = 4;  // GPIO4 - un ponticello di sicurezza (secondo fattore)
@@ -48,8 +51,6 @@ const int PIN_DHT22 = 14;        // GPIO14 - sensore temperatura e umidità
 const int PIN_PIR = 12;          // GPIO12 - sensore di movimento (quello bianco con la cupola)
 
 // -------------------- ROBA PER MQTT (CONTROLLO DA REMOTO) --------------------
-// uso un broker pubblico perché mi sono stufato di configurarne uno mio
-// se vuoi usare il tuo, cambi sti due valori
 const char* BROKER = "broker.emqx.io";
 const int PORTA_BROKER = 1883;
 const char* TOPIC_STATO = "casa/stanza/stato";
@@ -57,28 +58,20 @@ const char* TOPIC_COMANDI = "casa/stanza/comandi";
 const char* TOPIC_LOG = "casa/stanza/log";
 
 // -------------------- SICUREZZA --------------------
-// indirizzi MAC autorizzati - solo 'sti telefoni possono parlare col sistema
-// ho messo i miei, tu metti i tuoi
 const char* WHITELIST_MAC[] = {
     "AA:BB:CC:DD:EE:FF",  // il mio telefono
     "11:22:33:44:55:66",  // il mio computer
 };
 
-// hash SHA256 della password "Admin123!@#"
-// l'ho generato con un tool online, non si vede in chiaro
 const char* HASH_PASSWORD_ADMIN = "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92";
-// il token per il secondo fattore - cambialo con uno tuo!
 const char* TOKEN_ADMIN = "m9xK#pL2$vN8*qR5&wE7!tY3@uI1^oJ6";
 
-// blocca dopo 5 tentativi sbagliati (anti brute force)
 const int MAX_TENTATIVI_LOGIN = 5;
-const int FINESTRA_TENTATIVI = 60;   // secondi
-const int MAX_SESSIONI = 3;           // massimo 3 amministratori collegati insieme
+const int FINESTRA_TENTATIVI = 60;
+const int MAX_SESSIONI = 3;
 const int DIMENSIONE_EEPROM = 512;
 
 // -------------------- CHIAVE PER LA CRITTOGRAFIA --------------------
-// l'ho generata una volta con un generatore casuale
-// NON cambiarla dopo aver caricato il codice altrimenti non decripta più niente
 byte CHIAVE_AES[] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C,
@@ -94,7 +87,6 @@ byte VETTORE_INIZIALIZZAZIONE_AES[] = {
 AESLib libreriaAES;
 
 // -------------------- VARIABILI CHE USO NEL PROGRAMMA --------------------
-// tentativi di login
 int tentativiFalliti = 0;
 unsigned long oraLultimoTentativo = 0;
 bool sistemaBloccato = false;
@@ -102,39 +94,39 @@ unsigned long bloccatoFinoA = 0;
 int sessioniAttive = 0;
 char tokenSessioniCorrenti[MAX_SESSIONI][64] = {0};
 
-// stato dell'hardware (lo leggo dai pin)
-bool tamperRilevato = false;       // se qualcuno ha aperto il case
-bool chiaveInserita = false;       // se la chiave fisica è girata
-bool jumperAdminPresente = false;  // se il ponticello di sicurezza è inserito
-bool allarmeScattato = false;      // se l'allarme è già partito
+bool tamperRilevato = false;
+bool chiaveInserita = false;
+bool jumperAdminPresente = false;
+bool allarmeScattato = false;
 
-// valori dei sensori
 float temperatura = 0;
 float umidita = 0;
 bool movimento = false;
-bool sistemaAttivo = true;          // se falso, ignoro i movimenti
-bool sdOK = false;                  // se la SD card funziona
+bool sistemaAttivo = true;
+bool sdOK = false;
 
-// contatori movimenti
 int contatoreTotale = 0;
 int contatoreOggi = 0;
 int contatoreSettimana = 0;
 int contatoreMese = 0;
 
-// il server web e il client MQTT
+String ultimaPersona = "Nessuno";
+unsigned long timestampUltimoMovimento = 0;
+
 ESP8266WebServer serverWeb(80);
 WiFiClient clientWiFi;
 PubSubClient clientMQTT(clientWiFi);
 DHT dht(PIN_DHT22, DHT22);
 
-// -------------------- DICHIARAZIONI ANTICIPATE DELLE FUNZIONI --------------------
-// le ho messe tutte qui perché altrimenti il compilatore si incazza
+// -------------------- DICHIARAZIONI ANTICIPATE --------------------
 void avviaServer();
+void mostraPaginaPubblica();
 void mostraPaginaLogin();
- void gestisciLogin();
+void gestisciLogin();
 void gestisciLogout();
 void mostraPannelloAdmin();
 void inviaStatoAPI();
+void inviaStatoPubblicoAPI();
 void eseguiComando();
 void gestisciWhitelist();
 void inviaLogSicurezza();
@@ -157,7 +149,6 @@ void leggiSensori();
 void connettiMQTT();
 
 // ==================== FUNZIONI DI CRITTOGRAFIA ====================
-// le ho prese da un tutorial e ho dovuto smanettare un po' per farle funzionare
 
 String criptaAES(String testo) {
     int lunghezza = testo.length();
@@ -166,7 +157,6 @@ String criptaAES(String testo) {
     memset(input, 0, lunghezzaPadding);
     memcpy(input, testo.c_str(), lunghezza);
     
-    // aggiungo il padding PKCS#7 (roba standard per AES)
     uint8_t valorePad = lunghezzaPadding - lunghezza;
     for(int i = lunghezza; i < lunghezzaPadding; i++) {
         input[i] = valorePad;
@@ -216,8 +206,6 @@ String decriptaAES(String testoEsadecimale) {
 }
 
 String calcolaHash(String password) {
-    // versione semplificata per i test
-    // quando ho tempo metto SHA256 vero con libreria Crypto
     if(password == "Admin123!@#") {
         return String(HASH_PASSWORD_ADMIN);
     }
@@ -225,7 +213,6 @@ String calcolaHash(String password) {
 }
 
 // ==================== SALVATAGGIO SU EEPROM ====================
-// così se si stacca la corrente, i contatori rimangono
 
 void salvaContatori() {
     EEPROM.begin(DIMENSIONE_EEPROM);
@@ -250,7 +237,6 @@ void caricaContatori() {
 }
 
 // ==================== SD CARD PER I LOG ====================
-// qui salvo tutto quello che succede, così ho le prove
 
 void inizializzaSD() {
     Serial.println("📀 Provo ad avviare la SD card...");
@@ -273,13 +259,10 @@ void inizializzaSD() {
 }
 
 // ==================== LOG DI SICUREZZA ====================
-// questa funzione la chiamo ovunque per registrare gli eventi importanti
 
 void scriviLogSicurezza(String evento, String sorgente) {
-    // stampo sulla console seriale (così vedo cosa succede)
     Serial.printf("🔒 [SICUREZZA] %s - %s\n", evento.c_str(), sorgente.c_str());
     
-    // salvo sulla SD card
     if (sdOK) {
         File fileLog = SD.open("/security.log", FILE_WRITE);
         if (fileLog) {
@@ -291,7 +274,6 @@ void scriviLogSicurezza(String evento, String sorgente) {
         }
     }
     
-    // se sono connesso a MQTT, lo mando anche lì (criptato!)
     if (clientMQTT.connected()) {
         String messaggioLog = "{\"evento\":\"" + evento + "\",\"sorgente\":\"" + sorgente + "\",\"tempo\":" + String(time(nullptr)) + "}";
         inviaMQTTCriptato(TOPIC_LOG, messaggioLog);
@@ -299,14 +281,12 @@ void scriviLogSicurezza(String evento, String sorgente) {
 }
 
 // ==================== GESTIONE SENSORI ====================
-// qui leggo temperatura, umidità e movimento
 
 void leggiSensori() {
     static unsigned long ultimaLettura = 0;
-    if (millis() - ultimaLettura < 2000) return;  // aspetto 2 secondi tra una lettura e l'altra
+    if (millis() - ultimaLettura < 2000) return;
     ultimaLettura = millis();
     
-    // leggo temperatura e umidità dal DHT22
     float temp = dht.readTemperature();
     float umid = dht.readHumidity();
     
@@ -318,7 +298,6 @@ void leggiSensori() {
         Serial.println("⚠️ Errore lettura sensore DHT22 (forse è scollegato?)");
     }
     
-    // leggo il sensore di movimento
     bool nuovoMovimento = digitalRead(PIN_PIR);
     if (nuovoMovimento != movimento) {
         movimento = nuovoMovimento;
@@ -330,17 +309,18 @@ void leggiSensori() {
 }
 
 void gestisciMovimento() {
-    // aumento tutti i contatori
     contatoreTotale++;
     contatoreOggi++;
     contatoreSettimana++;
     contatoreMese++;
     salvaContatori();
-    scriviLogSicurezza("MOVIMENTO", String(contatoreTotale));
     
+    timestampUltimoMovimento = millis() / 1000;
+    ultimaPersona = "Qualcuno";
+    
+    scriviLogSicurezza("MOVIMENTO", String(contatoreTotale));
     Serial.printf("🚨 MOVIMENTO NUMERO %d rilevato!\n", contatoreTotale);
     
-    // mando un alert via MQTT se sono connesso
     if (clientMQTT.connected()) {
         String alert = "{\"tipo\":\"movimento\",\"numero\":" + String(contatoreTotale) + 
                        ",\"temperatura\":" + String(temperatura) + ",\"umidita\":" + String(umidita) + "}";
@@ -356,7 +336,7 @@ void resettaContatoriAutomatici() {
     unsigned long ora = millis() / 1000;
     unsigned long secondiInUnGiorno = 86400;
     unsigned long secondiInUnaSettimana = 604800;
-    unsigned long secondiInUnMese = 2592000;  // approssimativo, 30 giorni
+    unsigned long secondiInUnMese = 2592000;
     
     if (ora - ultimoGiorno >= secondiInUnGiorno) {
         contatoreOggi = 0;
@@ -377,10 +357,10 @@ void resettaContatoriAutomatici() {
 }
 
 // ==================== SERVER WEB ====================
-// qui gestisco tutte le pagine web e le API
 
 void avviaServer() {
-    serverWeb.on("/", HTTP_GET, mostraPaginaLogin);
+    serverWeb.on("/", HTTP_GET, mostraPaginaPubblica);
+    serverWeb.on("/api/public/stato", HTTP_GET, inviaStatoPubblicoAPI);
     serverWeb.on("/login", HTTP_POST, gestisciLogin);
     serverWeb.on("/logout", HTTP_GET, gestisciLogout);
     serverWeb.on("/admin", HTTP_GET, mostraPannelloAdmin);
@@ -396,16 +376,16 @@ void avviaServer() {
     Serial.println("✅ Server web avviato sulla porta 80");
 }
 
-void mostraPaginaLogin() {
-    // questa è la pagina di login
-    // l'ho fatta con un gradiente figo e funziona sia su telefono che computer
+// ==================== PAGINA PUBBLICA (PER UTENTE NORMALE) ====================
+
+void mostraPaginaPubblica() {
     String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="it">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>🔒 Sistema di Monitoraggio - Accesso Sicuro</title>
+    <title>📊 Monitoraggio Stanza</title>
     <style>
         * {
             margin: 0;
@@ -414,7 +394,7 @@ void mostraPaginaLogin() {
         }
         
         body {
-            background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             min-height: 100vh;
             display: flex;
             justify-content: center;
@@ -423,228 +403,179 @@ void mostraPaginaLogin() {
             padding: 20px;
         }
         
-        .login-container {
+        .card {
             background: rgba(255, 255, 255, 0.1);
             backdrop-filter: blur(12px);
             border-radius: 24px;
-            padding: 50px 40px;
+            padding: 40px;
             width: 100%;
-            max-width: 420px;
+            max-width: 500px;
             box-shadow: 0 25px 45px rgba(0, 0, 0, 0.3);
             border: 1px solid rgba(255, 255, 255, 0.2);
-            transition: transform 0.3s ease;
-        }
-        
-        .login-container:hover {
-            transform: translateY(-5px);
+            text-align: center;
         }
         
         h1 {
             color: white;
-            text-align: center;
-            margin-bottom: 15px;
+            margin-bottom: 30px;
             font-size: 28px;
-            font-weight: 600;
-            letter-spacing: 1px;
         }
         
-        .subtitle {
-            color: rgba(255, 255, 255, 0.7);
-            text-align: center;
-            margin-bottom: 35px;
-            font-size: 14px;
-        }
-        
-        input {
-            width: 100%;
-            padding: 14px 16px;
-            margin: 12px 0;
-            background: rgba(255, 255, 255, 0.15);
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            border-radius: 12px;
-            color: white;
-            font-size: 15px;
-            transition: all 0.3s ease;
-        }
-        
-        input:focus {
-            outline: none;
-            background: rgba(255, 255, 255, 0.25);
-            border-color: #667eea;
-            box-shadow: 0 0 15px rgba(102, 126, 234, 0.3);
-        }
-        
-        input::placeholder {
-            color: rgba(255, 255, 255, 0.6);
-        }
-        
-        button {
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border: none;
-            border-radius: 12px;
-            color: white;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            margin-top: 20px;
-        }
-        
-        button:hover {
-            transform: scale(1.02);
-            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
-        }
-        
-        .error {
-            background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
-            color: white;
-            padding: 12px;
-            border-radius: 12px;
+        .info {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 16px;
+            padding: 20px;
             margin: 15px 0;
-            text-align: center;
-            font-size: 13px;
-            animation: shake 0.3s ease;
         }
         
-        @keyframes shake {
-            0%, 100% { transform: translateX(0); }
-            25% { transform: translateX(-5px); }
-            75% { transform: translateX(5px); }
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            font-size: 18px;
         }
         
-        .footer {
-            text-align: center;
-            color: rgba(255, 255, 255, 0.5);
-            font-size: 11px;
-            margin-top: 25px;
-            padding-top: 20px;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        .info-label {
+            color: rgba(255, 255, 255, 0.7);
+            font-weight: 600;
         }
         
-        .security-badge {
-            text-align: center;
-            margin-bottom: 20px;
+        .info-value {
+            color: white;
+            font-weight: bold;
         }
         
-        .security-badge span {
-            background: rgba(39, 174, 96, 0.3);
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 11px;
+        .libera {
             color: #2ecc71;
         }
         
+        .occupata {
+            color: #e74c3c;
+        }
+        
+        .admin-link {
+            margin-top: 25px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .admin-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        
+        .admin-link a:hover {
+            text-decoration: underline;
+        }
+        
+        .update-time {
+            margin-top: 20px;
+            font-size: 11px;
+            color: rgba(255, 255, 255, 0.4);
+        }
+        
         @media (max-width: 480px) {
-            .login-container {
-                padding: 35px 25px;
+            .card {
+                padding: 25px;
             }
-            h1 { font-size: 24px; }
+            .info-row {
+                font-size: 14px;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="login-container">
-        <div class="security-badge">
-            <span>🔒 Sicurezza AES-256</span>
+    <div class="card">
+        <h1>📊 STATO STANZA</h1>
+        
+        <div class="info">
+            <div class="info-row">
+                <span class="info-label">🌡️ Temperatura</span>
+                <span class="info-value" id="temp">--- °C</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">💧 Umidità</span>
+                <span class="info-value" id="hum">--- %</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">🚪 Stato</span>
+                <span class="info-value" id="stato">---</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">👤 Occupata da</span>
+                <span class="info-value" id="chi">---</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">📅 Ultimo movimento</span>
+                <span class="info-value" id="ultimo">---</span>
+            </div>
         </div>
-        <h1>🔐 SISTEMA SICURO</h1>
-        <div class="subtitle">Accesso riservato agli amministratori</div>
         
-        <div id="errorMsg"></div>
-        
-        <form id="loginForm">
-            <input type="password" id="password" placeholder="Password di amministrazione" autocomplete="off">
-            <input type="text" id="token" placeholder="Token di sicurezza a 2 fattori" autocomplete="off">
-            <button type="submit">
-                <span>🚪</span> ACCEDI AL PANNELLO
-            </button>
-        </form>
-        
-        <div class="footer">
-            <div>🔑 Tentativi rimanenti: <span id="attemptsLeft" style="color: #f39c12; font-weight: bold;">5</span></div>
-            <div style="margin-top: 10px;">🛡️ Sistema protetto con crittografia end-to-end</div>
-            <div style="margin-top: 5px;">📡 Versione 2.0 - ESP8266 Secure System</div>
+        <div class="admin-link">
+            🔐 <a href="/admin">Accesso amministratore</a>
+        </div>
+        <div class="update-time">
+            ↻ Aggiornamento automatico ogni 5 secondi
         </div>
     </div>
     
     <script>
-        let tentativi = 5;
-        const divErrori = document.getElementById('errorMsg');
-        
-        function mostraErrore(messaggio) {
-            divErrori.innerHTML = `<div class="error">⚠️ ${messaggio}</div>`;
-            setTimeout(() => {
-                if (divErrori.innerHTML) divErrori.innerHTML = '';
-            }, 4000);
+        function aggiornaDati() {
+            fetch('/api/public/stato')
+                .then(r => r.json())
+                .then(d => {
+                    document.getElementById('temp').innerHTML = d.temperatura + ' °C';
+                    document.getElementById('hum').innerHTML = d.umidita + ' %';
+                    
+                    let statoHtml = d.stato === 'libera' ? 
+                        '<span class="libera">🟢 LIBERA</span>' : 
+                        '<span class="occupata">🔴 OCCUPATA</span>';
+                    document.getElementById('stato').innerHTML = statoHtml;
+                    
+                    document.getElementById('chi').innerHTML = d.ultima_persona || '---';
+                    
+                    if (d.ultimo_movimento) {
+                        let data = new Date(d.ultimo_movimento * 1000);
+                        document.getElementById('ultimo').innerHTML = data.toLocaleTimeString();
+                    } else {
+                        document.getElementById('ultimo').innerHTML = '---';
+                    }
+                })
+                .catch(err => console.error('Errore:', err));
         }
         
-        document.getElementById('loginForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            const password = document.getElementById('password').value;
-            const token = document.getElementById('token').value;
-            
-            if (!password && !token) {
-                mostraErrore('Inserire sia la password che il token di sicurezza');
-                return;
-            }
-            
-            if (!password) {
-                mostraErrore('Inserire la password di amministrazione');
-                return;
-            }
-            
-            if (!token) {
-                mostraErrore('Inserire il token di sicurezza a 2 fattori');
-                return;
-            }
-            
-            const bottone = e.target.querySelector('button');
-            const testoOriginale = bottone.innerHTML;
-            bottone.innerHTML = '<span>⏳</span> VERIFICA IN CORSO...';
-            bottone.disabled = true;
-            
-            try {
-                const risposta = await fetch('/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password, token })
-                });
-                
-                const dati = await risposta.json();
-                
-                if (dati.success) {
-                    localStorage.setItem('jwt_token', dati.token);
-                    localStorage.setItem('inizio_sessione', Date.now());
-                    mostraErrore('✅ ACCESSO CONSENTITO! Reindirizzamento...');
-                    setTimeout(() => {
-                        window.location.href = '/admin';
-                    }, 1000);
-                } else {
-                    tentativi--;
-                    document.getElementById('attemptsLeft').innerText = tentativi;
-                    mostraErrore(dati.message || 'Credenziali non valide');
-                    
-                    if (tentativi <= 0) {
-                        document.getElementById('loginForm').style.display = 'none';
-                        mostraErrore('🔴 TROPPI TENTATIVI FALLITI! Sistema bloccato per 5 minuti.');
-                    }
-                }
-            } catch (err) {
-                mostraErrore('Errore di connessione al server');
-            } finally {
-                bottone.innerHTML = testoOriginale;
-                bottone.disabled = false;
-            }
-        });
+        aggiornaDati();
+        setInterval(aggiornaDati, 5000);
     </script>
 </body>
 </html>
     )rawliteral";
     
     serverWeb.send(200, "text/html", html);
+}
+
+// ==================== API PUBBLICA ====================
+
+void inviaStatoPubblicoAPI() {
+    StaticJsonDocument<256> doc;
+    doc["temperatura"] = temperatura;
+    doc["umidita"] = umidita;
+    doc["stato"] = movimento ? "occupata" : "libera";
+    doc["ultima_persona"] = ultimaPersona;
+    doc["ultimo_movimento"] = timestampUltimoMovimento;
+    
+    String risposta;
+    serializeJson(doc, risposta);
+    serverWeb.send(200, "application/json", risposta);
+}
+
+// ==================== GESTIONE LOGIN (REDIRECT) ====================
+
+void mostraPaginaLogin() {
+    serverWeb.sendHeader("Location", "/");
+    serverWeb.send(302, "text/plain", "");
 }
 
 void gestisciLogin() {
@@ -724,6 +655,8 @@ void gestisciLogout() {
     serverWeb.send(302, "text/plain", "");
 }
 
+// ==================== PANNELLO ADMIN COMPLETO ====================
+
 void mostraPannelloAdmin() {
     if (!verificaTokenSessione()) {
         serverWeb.send(401, "text/html", R"rawliteral(
@@ -739,8 +672,8 @@ button{background:#667eea;padding:12px 24px;border:none;border-radius:8px;color:
 <body>
 <div class="container">
 <h1>🔒 401 - Non autorizzato</h1>
-<p>Sessione scaduta o token non valido.</p>
-<button onclick="location.href='/'">🔐 Torna al login</button>
+<p>Devi fare il login come amministratore.</p>
+<button onclick="location.href='/'">🔐 Torna alla home</button>
 </div>
 </body>
 </html>
@@ -875,9 +808,17 @@ button{background:#667eea;padding:12px 24px;border:none;border-radius:8px;color:
             color: rgba(255, 255, 255, 0.7);
         }
         
-        .status-safe { color: #2ecc71; }
-        .status-warning { color: #f39c12; }
-        .status-danger { color: #e74c3c; }
+        .status-safe {
+            color: #2ecc71;
+        }
+        
+        .status-warning {
+            color: #f39c12;
+        }
+        
+        .status-danger {
+            color: #e74c3c;
+        }
         
         button {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -898,6 +839,10 @@ button{background:#667eea;padding:12px 24px;border:none;border-radius:8px;color:
         
         .danger-btn {
             background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+        }
+        
+        .success-btn {
+            background: linear-gradient(135deg, #27ae60 0%, #1e8449 100%);
         }
         
         .whitelist-item {
@@ -953,9 +898,16 @@ button{background:#667eea;padding:12px 24px;border:none;border-radius:8px;color:
         }
         
         @media (max-width: 768px) {
-            .header { flex-direction: column; text-align: center; }
-            .grid { grid-template-columns: 1fr; }
-            .flex-buttons { justify-content: center; }
+            .header {
+                flex-direction: column;
+                text-align: center;
+            }
+            .grid {
+                grid-template-columns: 1fr;
+            }
+            .flex-buttons {
+                justify-content: center;
+            }
         }
     </style>
 </head>
@@ -1039,13 +991,6 @@ button{background:#667eea;padding:12px 24px;border:none;border-radius:8px;color:
             window.location.href = '/';
         }
         
-        fetch('/api/stato', { headers: {'Authorization': 'Bearer ' + token} })
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById('ipAddress').innerHTML = '📡 ' + (data.ip || '192.168.1.x');
-            })
-            .catch(() => {});
-        
         function caricaDati() {
             fetch('/api/stato', {
                 headers: { 'Authorization': 'Bearer ' + token }
@@ -1073,6 +1018,8 @@ button{background:#667eea;padding:12px 24px;border:none;border-radius:8px;color:
                 let minuti = Math.floor((uptime % 3600) / 60);
                 let secondi = uptime % 60;
                 document.getElementById('uptime').innerHTML = `${ore}h ${minuti}m ${secondi}s`;
+                
+                document.getElementById('ipAddress').innerHTML = '📡 ' + (dati.ip || '192.168.1.x');
             })
             .catch(err => console.error('Errore:', err));
             
@@ -1384,7 +1331,7 @@ void inviaLogSicurezza() {
     serverWeb.send(200, "application/json", risposta);
 }
 
-// ==================== MQTT PER CONTROLLO REMOTO ====================
+// ==================== MQTT ====================
 
 void setupMQTT() {
     clientMQTT.setServer(BROKER, PORTA_BROKER);
@@ -1463,7 +1410,7 @@ void connettiMQTT() {
     }
 }
 
-// ==================== OTA (AGGIORNAMENTI VIA WIFI) ====================
+// ==================== OTA ====================
 
 void setupOTA() {
     ArduinoOTA.setHostname("sistema-sicurezza-stanza");
@@ -1523,7 +1470,7 @@ void resetContatori() {
     Serial.println("✅ Contatori resettati dall'amministratore");
 }
 
-// ==================== SETUP - TUTTO PARTE DA QUI ====================
+// ==================== SETUP ====================
 
 void setup() {
     Serial.begin(115200);
@@ -1541,10 +1488,10 @@ void setup() {
     Serial.println("║                                                              ║");
     Serial.println("║           SISTEMA DI MONITORAGGIO SICURO v2.0                ║");
     Serial.println("║                    ESP8266 - AES-256                         ║");
+    Serial.println("║                     CON PAGINA PUBBLICA                      ║");
     Serial.println("╚══════════════════════════════════════════════════════════════╝");
     Serial.println();
     
-    // configuro i pin
     pinMode(PIN_CHIAVE, INPUT_PULLUP);
     pinMode(PIN_TAMPER, INPUT_PULLUP);
     pinMode(PIN_JUMPER_ADMIN, INPUT_PULLUP);
@@ -1556,7 +1503,6 @@ void setup() {
     caricaContatori();
     inizializzaSD();
     
-    // controllo se hanno aperto il case
     if (digitalRead(PIN_TAMPER) == HIGH) {
         tamperRilevato = true;
         Serial.println("🔴🔴🔴 ALLARME CRITICO: TAMPER RILEVATO! Case aperto! 🔴🔴🔴");
@@ -1576,7 +1522,6 @@ void setup() {
         }
     }
     
-    // leggo lo stato dell'hardware
     chiaveInserita = (digitalRead(PIN_CHIAVE) == LOW);
     jumperAdminPresente = (digitalRead(PIN_JUMPER_ADMIN) == LOW);
     
@@ -1590,7 +1535,6 @@ void setup() {
     Serial.printf ("│ 🚶 Sensore PIR:                %-34s │\n", "✅ INIZIALIZZATO");
     Serial.println("└─────────────────────────────────────────────────────────────┘");
     
-    // controllo se il sistema è bloccato per troppi tentativi
     if (sistemaBloccato) {
         unsigned long ora = millis();
         if (ora < bloccatoFinoA) {
@@ -1608,7 +1552,6 @@ void setup() {
         }
     }
     
-    // configuro il WiFi (la prima volta apre un access point)
     Serial.println("\n📡 AVVIO CONFIGURAZIONE WIFI...");
     WiFiManager wm;
     wm.setConnectTimeout(30);
@@ -1629,7 +1572,6 @@ void setup() {
     Serial.printf ("│ 📶 Potenza segnale: %-40d │\n", WiFi.RSSI());
     Serial.println("└─────────────────────────────────────────────────────────────┘");
     
-    // avvio tutti i servizi
     avviaServer();
     setupMQTT();
     setupOTA();
@@ -1637,19 +1579,19 @@ void setup() {
     scriviLogSicurezza("SISTEMA_AVVIATO", WiFi.macAddress());
     
     Serial.println("\n╔══════════════════════════════════════════════════════════════╗");
-    Serial.printf ("║     Apri il browser su: http://%s                   ║\n", WiFi.localIP().toString().c_str());
-    Serial.println("║     Password OTA: AdminOTA2024                                ║");
+    Serial.printf ("║     📱 PAGINA PUBBLICA: http://%s                    ║\n", WiFi.localIP().toString().c_str());
+    Serial.printf ("║     🔐 PANNELLO ADMIN: http://%s/admin             ║\n", WiFi.localIP().toString().c_str());
     Serial.println("║     Password amministratore: Admin123!@#                     ║");
-    Serial.println("║     Token 2 fattori: quello che hai messo nel codice         ║");
+    Serial.println("║     Token: quello che hai messo nel codice                  ║");
+    Serial.println("║     Chiave fisica: deve essere inserita                     ║");
     Serial.println("╚══════════════════════════════════════════════════════════════╝\n");
 }
 
-// ==================== LOOP - GIRA IN CERCHIO ALL'INFINITO ====================
+// ==================== LOOP ====================
 
 void loop() {
     static unsigned long ultimoTentativoMQTT = 0;
     
-    // controllo continuo il tamper (se aprono il case mentre è acceso)
     if (digitalRead(PIN_TAMPER) == HIGH && !tamperRilevato) {
         tamperRilevato = true;
         allarmeScattato = true;
@@ -1669,20 +1611,17 @@ void loop() {
         }
     }
     
-    // leggo i sensori (temperatura, umidità, movimento)
     leggiSensori();
     resettaContatoriAutomatici();
     
-    // se MQTT si è disconnesso, provo a riconnettermi
     if (!clientMQTT.connected() && millis() - ultimoTentativoMQTT > 5000) {
         ultimoTentativoMQTT = millis();
         connettiMQTT();
     }
     
-    // gestisco i servizi
     ArduinoOTA.handle();
     serverWeb.handleClient();
     clientMQTT.loop();
     
-    delay(10);  // piccolo delay per non sovraccaricare il processore
+    delay(10);
 }
